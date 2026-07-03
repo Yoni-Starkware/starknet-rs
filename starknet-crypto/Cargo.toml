@@ -34,6 +34,7 @@ signature-display = ["dep:hex", "alloc"]
 pedersen_no_lookup = []
 
 [dev-dependencies]
+blake2 = "0.10"
 criterion = { version = "0.4.0", default-features = false }
 hex = "0.4.3"
 hex-literal = "0.4.1"

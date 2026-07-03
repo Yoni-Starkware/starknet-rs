@@ -1,0 +1,825 @@
+//! Optimized STARK-curve ECDSA verification.
+//!
+//! Same result as [`crate::verify`], but replaces the two independent binary
+//! double-and-add scalar multiplications with:
+//!   * a fixed-base table for `z*w*G` (G is constant) -> zero point doublings,
+//!   * a width-`W` wNAF windowed multiply for `r*w*Q` -> ~1/(W+1) additions,
+//!   * clean `double()` calls (no equal-point probe waste),
+//!   * mixed projective+affine additions for the fixed-base term.
+//!
+//! The `+/-` final check mirrors `verify`: the public key is recovered from its
+//! x-coordinate only, so both y-sign candidates are tried.
+
+use crypto_bigint::modular::runtime_mod::{DynResidue, DynResidueParams};
+use crypto_bigint::{ArrayEncoding, U256};
+use starknet_curve::curve_params::{ALPHA, BETA, GENERATOR};
+use starknet_types_core::curve::{AffinePoint, ProjectivePoint};
+use starknet_types_core::felt::Felt;
+use std::sync::OnceLock;
+
+use crate::VerifyError;
+
+/// The STARK curve group order (`EC_ORDER`) as a `crypto-bigint` `U256`, used for
+/// fixed-size Montgomery scalar-field arithmetic instead of heap-allocating num-bigint.
+const SCALAR_MODULUS: U256 =
+    U256::from_be_hex("0800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f");
+
+/// Montgomery parameters for `SCALAR_MODULUS`, computed at compile time so no
+/// per-verify call re-derives R^2 and the modular negated inverse.
+const SCALAR_PARAMS: DynResidueParams<{ U256::LIMBS }> = DynResidueParams::new(&SCALAR_MODULUS);
+
+fn felt_to_u256(value: &Felt) -> U256 {
+    U256::from_be_slice(&value.to_bytes_be())
+}
+
+fn u256_to_felt(value: &U256) -> Felt {
+    Felt::from_bytes_be(&value.to_be_byte_array().into())
+}
+
+const ELEMENT_UPPER_BOUND: Felt = Felt::from_raw([
+    576459263475450960,
+    18446744073709255680,
+    160989183,
+    18446743986131435553,
+]);
+
+/// wNAF window width for the variable-base (`r*w*Q`) multiply.
+const WINDOW: u32 = 5;
+
+/// Window width (bits) for the fixed-base comb over G. 7 divides 252 evenly.
+const G_WINDOW: usize = 7;
+/// Number of windows: scalars are reduced mod `EC_ORDER < 2^252`, so 252 bits suffice.
+const G_WINDOWS: usize = 252 / G_WINDOW;
+/// Nonzero digits per window: `1..=2^G_WINDOW - 1`.
+const G_DIGITS: usize = (1 << G_WINDOW) - 1;
+
+/// Fixed-base comb table: `table[k][j] = (j + 1) * 2^(G_WINDOW*k) * G` (affine).
+/// `scalar * G` is then one mixed add per window, with zero doublings.
+fn fixed_base_g_table() -> &'static Vec<Vec<AffinePoint>> {
+    static TABLE: OnceLock<Vec<Vec<AffinePoint>>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = Vec::with_capacity(G_WINDOWS);
+        let mut window_base = ProjectivePoint::from_affine(GENERATOR.x(), GENERATOR.y()).unwrap();
+        for _ in 0..G_WINDOWS {
+            // Build the window's multiples projectively, then normalize the whole
+            // batch with a single inversion (Montgomery's trick) rather than one
+            // per point -- this is a one-time table build, but it keeps cold-start
+            // to ~one inversion per window instead of `G_DIGITS`.
+            let mut projective = Vec::with_capacity(G_DIGITS);
+            let mut multiple = window_base.clone();
+            for _ in 0..G_DIGITS {
+                projective.push(multiple.clone());
+                multiple += &window_base;
+            }
+            table.push(batch_to_affine(&projective));
+            // Advance to the next window: multiply the base by 2^G_WINDOW.
+            for _ in 0..G_WINDOW {
+                window_base = window_base.double();
+            }
+        }
+        table
+    })
+}
+
+/// Normalize homogeneous projective points to affine with a single field inversion
+/// for the whole slice (Montgomery's batch-inversion trick). Inputs must have Z != 0.
+fn batch_to_affine(points: &[ProjectivePoint]) -> Vec<AffinePoint> {
+    let mut prefix = Vec::with_capacity(points.len());
+    let mut running = Felt::ONE;
+    for point in points {
+        running = running * point.z();
+        prefix.push(running);
+    }
+    let mut inverse = running.inverse().expect("generator multiples have nonzero Z");
+    let mut affine = vec![AffinePoint::identity(); points.len()];
+    for index in (0..points.len()).rev() {
+        let preceding = if index == 0 { Felt::ONE } else { prefix[index - 1] };
+        let z_inverse = inverse * preceding;
+        inverse = inverse * points[index].z();
+        affine[index] = AffinePoint::new(points[index].x() * z_inverse, points[index].y() * z_inverse)
+            .expect("normalized generator multiple is on curve");
+    }
+    affine
+}
+
+/// `scalar * G` via the fixed-base comb: one mixed add per window, zero doublings.
+fn fixed_base_mul(scalar: &Felt) -> ProjectivePoint {
+    let table = fixed_base_g_table();
+    let bits = scalar.to_bits_le();
+    let mut acc = ProjectivePoint::identity();
+    for (window_index, multiples) in table.iter().enumerate() {
+        let mut digit = 0usize;
+        for bit_offset in 0..G_WINDOW {
+            if bits[window_index * G_WINDOW + bit_offset] {
+                digit |= 1 << bit_offset;
+            }
+        }
+        if digit != 0 {
+            acc += &multiples[digit - 1];
+        }
+    }
+    acc
+}
+
+/// Signed-digit (wNAF) form of `scalar`, little-endian (index 0 = least significant).
+/// Nonzero digits are odd and lie in `(-2^W, 2^W)`. Allocation-free arithmetic on
+/// 256-bit little-endian limbs.
+fn wnaf(scalar: &Felt, width: u32) -> Vec<i8> {
+    let bytes = scalar.to_bytes_le();
+    let mut limbs = [0u64; 4];
+    for (index, limb) in limbs.iter_mut().enumerate() {
+        *limb = u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap());
+    }
+
+    let half = 1u64 << (width - 1);
+    let full = 1u64 << width;
+    let mask = full - 1;
+
+    let mut digits = Vec::with_capacity(256);
+    while !is_zero(&limbs) {
+        if limbs[0] & 1 == 1 {
+            let residue = limbs[0] & mask;
+            if residue >= half {
+                // digit is negative: subtracting it means adding (full - residue).
+                add_small(&mut limbs, full - residue);
+                digits.push((residue as i64 - full as i64) as i8);
+            } else {
+                sub_small(&mut limbs, residue);
+                digits.push(residue as i8);
+            }
+        } else {
+            digits.push(0);
+        }
+        shr_one(&mut limbs);
+    }
+    digits
+}
+
+fn is_zero(limbs: &[u64; 4]) -> bool {
+    limbs.iter().all(|&limb| limb == 0)
+}
+
+/// `limbs += addend` (addend fits in a limb), with carry propagation.
+fn add_small(limbs: &mut [u64; 4], addend: u64) {
+    let (sum, mut carry) = limbs[0].overflowing_add(addend);
+    limbs[0] = sum;
+    let mut index = 1;
+    while carry && index < 4 {
+        let (next, next_carry) = limbs[index].overflowing_add(1);
+        limbs[index] = next;
+        carry = next_carry;
+        index += 1;
+    }
+}
+
+/// `limbs -= subtrahend` (subtrahend <= limbs[0]-relevant), with borrow propagation.
+fn sub_small(limbs: &mut [u64; 4], subtrahend: u64) {
+    let (diff, mut borrow) = limbs[0].overflowing_sub(subtrahend);
+    limbs[0] = diff;
+    let mut index = 1;
+    while borrow && index < 4 {
+        let (next, next_borrow) = limbs[index].overflowing_sub(1);
+        limbs[index] = next;
+        borrow = next_borrow;
+        index += 1;
+    }
+}
+
+/// Logical right shift of the 256-bit value by one bit.
+fn shr_one(limbs: &mut [u64; 4]) {
+    limbs[0] = (limbs[0] >> 1) | (limbs[1] << 63);
+    limbs[1] = (limbs[1] >> 1) | (limbs[2] << 63);
+    limbs[2] = (limbs[2] >> 1) | (limbs[3] << 63);
+    limbs[3] >>= 1;
+}
+
+/// Point in Jacobian coordinates: affine = (X/Z^2, Y/Z^3); infinity has Z = 0.
+/// Jacobian doubling costs 1M+8S versus ~7M+5S for the homogeneous formulas the
+/// generic path uses, and squarings are cheaper than multiplies (SOS squaring),
+/// which is what makes the doubling-dominated wNAF loop faster in this system.
+#[derive(Clone, Copy)]
+struct JacobianPoint {
+    x: Felt,
+    y: Felt,
+    z: Felt,
+}
+
+const JACOBIAN_INFINITY: JacobianPoint = JacobianPoint { x: Felt::ONE, y: Felt::ONE, z: Felt::ZERO };
+
+impl JacobianPoint {
+    fn from_affine_point(point: &AffinePoint) -> Self {
+        Self { x: point.x(), y: point.y(), z: Felt::ONE }
+    }
+
+    fn neg(&self) -> Self {
+        Self { x: self.x, y: -self.y, z: self.z }
+    }
+
+    /// dbl-2007-bl with the STARK curve's a = 1 (so `a*Z^4` is just `(Z^2)^2`):
+    /// 1M + 8S. A 2-torsion input (y = 0) naturally yields Z3 = 0 (infinity).
+    fn double(&self) -> Self {
+        if self.z == Felt::ZERO {
+            return *self;
+        }
+        let xx = self.x.square();
+        let yy = self.y.square();
+        let yyyy = yy.square();
+        let zz = self.z.square();
+        let s_term = {
+            let sum_square = (self.x + yy).square();
+            let s_half = sum_square - xx - yyyy;
+            s_half + s_half
+        };
+        let m_term = xx + xx + xx + zz.square();
+        let t_term = m_term.square() - s_term - s_term;
+        let eight_yyyy = {
+            let two = yyyy + yyyy;
+            let four = two + two;
+            four + four
+        };
+        let z3 = (self.y + self.z).square() - yy - zz;
+        Self { x: t_term, y: m_term * (s_term - t_term) - eight_yyyy, z: z3 }
+    }
+
+    /// add-2007-bl full Jacobian addition: 11M + 5S. Handles the special cases
+    /// (either operand at infinity, doubling, opposite points) exactly.
+    fn add(&self, other: &Self) -> Self {
+        if self.z == Felt::ZERO {
+            return *other;
+        }
+        if other.z == Felt::ZERO {
+            return *self;
+        }
+        let z1z1 = self.z.square();
+        let z2z2 = other.z.square();
+        let u1 = self.x * z2z2;
+        let u2 = other.x * z1z1;
+        let s1 = self.y * other.z * z2z2;
+        let s2 = other.y * self.z * z1z1;
+        let h = u2 - u1;
+        let r_half = s2 - s1;
+        if h == Felt::ZERO {
+            return if r_half == Felt::ZERO { self.double() } else { JACOBIAN_INFINITY };
+        }
+        let i_term = {
+            let two_h = h + h;
+            two_h.square()
+        };
+        let j_term = h * i_term;
+        let r_term = r_half + r_half;
+        let v_term = u1 * i_term;
+        let x3 = r_term.square() - j_term - v_term - v_term;
+        let s1_j = s1 * j_term;
+        let y3 = r_term * (v_term - x3) - (s1_j + s1_j);
+        let z3 = ((self.z + other.z).square() - z1z1 - z2z2) * h;
+        Self { x: x3, y: y3, z: z3 }
+    }
+
+    /// Convert to the homogeneous projective system without a field inversion:
+    /// affine = (X/Z^2, Y/Z^3), so scaling by Z^3 gives homogeneous (X*Z, Y, Z^3).
+    fn to_homogeneous(&self) -> ProjectivePoint {
+        if self.z == Felt::ZERO {
+            return ProjectivePoint::identity();
+        }
+        let zz = self.z.square();
+        ProjectivePoint::new(self.x * self.z, self.y, zz * self.z)
+    }
+}
+
+/// `scalar * point` via width-`WINDOW` wNAF over Jacobian coordinates:
+/// ~251 doublings (1M+8S each) + ~scalar_bits/(W+1) full additions.
+fn windowed_mul(point: &AffinePoint, scalar: &Felt) -> ProjectivePoint {
+    // Odd-multiple table: odd_multiples[j] = (2j + 1) * point.
+    // Width-W wNAF digits are odd with |d| <= 2^(W-1) - 1, so the max table index
+    // is (2^(W-1) - 2)/2 = 2^(W-2) - 1: exactly 2^(W-2) entries are needed.
+    let base = JacobianPoint::from_affine_point(point);
+    let twice = base.double();
+    let table_len = 1usize << (WINDOW - 2);
+    let mut odd_multiples = Vec::with_capacity(table_len);
+    odd_multiples.push(base);
+    for j in 1..table_len {
+        odd_multiples.push(odd_multiples[j - 1].add(&twice));
+    }
+
+    let digits = wnaf(scalar, WINDOW);
+    let mut acc = JACOBIAN_INFINITY;
+    for &digit in digits.iter().rev() {
+        acc = acc.double();
+        if digit > 0 {
+            acc = acc.add(&odd_multiples[(digit as usize - 1) / 2]);
+        } else if digit < 0 {
+            acc = acc.add(&odd_multiples[((-digit) as usize - 1) / 2].neg());
+        }
+    }
+    acc.to_homogeneous()
+}
+
+// Fixed exponents for the STARK prime p = 2^251 + 17*2^192 + 1, as little-endian
+// u64 limbs. Both are sparse, so exponentiation is dominated by squarings.
+//   (p-1)/2 = 2^250 + 17*2^191            (Euler's criterion / Legendre symbol)
+//   (p+1)/2 = 2^250 + 17*2^191 + 1        (Cipolla exponent)
+const EXP_P_MINUS_1_OVER_2: [u64; 4] = [0, 0, 0x8000_0000_0000_0000, 0x0400_0000_0000_0008];
+const EXP_P_PLUS_1_OVER_2: [u64; 4] = [1, 0, 0x8000_0000_0000_0000, 0x0400_0000_0000_0008];
+
+/// `base^exp mod p` (square-and-multiply, MSB first) over the fixed-width exponent.
+fn pow_fp(base: &Felt, exp: &[u64; 4]) -> Felt {
+    let mut result = Felt::ONE;
+    for word in exp.iter().rev() {
+        for bit in (0..64).rev() {
+            result = result * result;
+            if (word >> bit) & 1 == 1 {
+                result = result * *base;
+            }
+        }
+    }
+    result
+}
+
+/// Multiply in F_p2 = F_p[t]/(t^2 - nqr), elements as `(a, b)` meaning `a + b*t`.
+fn fp2_mul(x: (Felt, Felt), y: (Felt, Felt), nqr: Felt) -> (Felt, Felt) {
+    let (a, b) = x;
+    let (c, d) = y;
+    (a * c + b * d * nqr, a * d + b * c)
+}
+
+/// Square in F_p2.
+fn fp2_square(x: (Felt, Felt), nqr: Felt) -> (Felt, Felt) {
+    let (a, b) = x;
+    let ab = a * b;
+    (a * a + b * b * nqr, ab + ab)
+}
+
+/// `base^exp` in F_p2 (square-and-multiply, MSB first).
+fn fp2_pow(base: (Felt, Felt), exp: &[u64; 4], nqr: Felt) -> (Felt, Felt) {
+    let mut result = (Felt::ONE, Felt::ZERO);
+    for word in exp.iter().rev() {
+        for bit in (0..64).rev() {
+            result = fp2_square(result, nqr);
+            if (word >> bit) & 1 == 1 {
+                result = fp2_mul(result, base, nqr);
+            }
+        }
+    }
+    result
+}
+
+/// Modular square root on the STARK field via Cipolla's algorithm, which is
+/// O(log p) and so avoids the O(2-adicity^2) blowup of Tonelli-Shanks on this
+/// prime (2-adicity 192). Returns `None` when `value` is a non-residue.
+///
+/// There is deliberately no upfront Euler/Legendre residuosity check: the
+/// candidate root is validated with a single squaring at the end, which is
+/// correct for residues and rejects non-residues (whose candidate cannot
+/// square back to `value`). This saves a full (p-1)/2 exponentiation per call.
+fn stark_sqrt(value: &Felt) -> Option<Felt> {
+    if *value == Felt::ZERO {
+        return Some(Felt::ZERO);
+    }
+    // Find `a` with `a^2 - value` a non-residue, so F_p[t]/(t^2 - (a^2 - value)) is a field.
+    let mut a = Felt::from(2u64);
+    let nqr = loop {
+        let candidate = a * a - *value;
+        if candidate == Felt::ZERO {
+            // value == a^2, so `a` already is the square root.
+            return Some(a);
+        }
+        if pow_fp(&candidate, &EXP_P_MINUS_1_OVER_2) != Felt::ONE {
+            break candidate;
+        }
+        a = a + Felt::ONE;
+    };
+    // For a residue, (a + t)^((p+1)/2) lands in F_p and is a square root of `value`.
+    let (root, _imag) = fp2_pow((a, Felt::ONE), &EXP_P_PLUS_1_OVER_2, nqr);
+    (root * root == *value).then_some(root)
+}
+
+/// Input-range checks shared by `verify_fast` and `verify_batch`. `Ok(())` means
+/// the tuple is well-formed enough to invert `s` and finish verification.
+fn check_ranges(message: &Felt, r: &Felt, s: &Felt) -> Result<(), VerifyError> {
+    if message >= &ELEMENT_UPPER_BOUND {
+        return Err(VerifyError::InvalidMessageHash);
+    }
+    if r == &Felt::ZERO || r >= &ELEMENT_UPPER_BOUND {
+        return Err(VerifyError::InvalidR);
+    }
+    if s == &Felt::ZERO || s >= &ELEMENT_UPPER_BOUND {
+        return Err(VerifyError::InvalidS);
+    }
+    Ok(())
+}
+
+/// Recover the full public-key point from its x-coordinate. The y sign does not
+/// matter for verification because the final check tries both `+/-` candidates.
+fn recover_public_key_point(public_key: &Felt) -> Result<AffinePoint, VerifyError> {
+    let y_squared = public_key.square() * public_key + ALPHA * public_key + BETA;
+    Ok(
+        AffinePoint::new(*public_key, stark_sqrt(&y_squared).ok_or(VerifyError::InvalidPublicKey)?)
+            .unwrap(),
+    )
+}
+
+/// Finish verification given the full public-key point and the precomputed scalar
+/// inverse `w_residue = s^-1 mod n`.
+fn verify_point_with_inverse(
+    public_key_point: &AffinePoint,
+    message: &Felt,
+    r: &Felt,
+    w_residue: DynResidue<{ U256::LIMBS }>,
+) -> Result<bool, VerifyError> {
+    let w = u256_to_felt(&w_residue.retrieve());
+    if w == Felt::ZERO || w >= ELEMENT_UPPER_BOUND {
+        return Err(VerifyError::InvalidS);
+    }
+
+    let message_residue = DynResidue::new(&felt_to_u256(message), SCALAR_PARAMS);
+    let r_residue = DynResidue::new(&felt_to_u256(r), SCALAR_PARAMS);
+    let zw = u256_to_felt(&(message_residue * w_residue).retrieve());
+    let zw_g = fixed_base_mul(&zw);
+
+    let rw = u256_to_felt(&(r_residue * w_residue).retrieve());
+    let rw_q = windowed_mul(public_key_point, &rw);
+
+    // Compare the affine x-coordinate against r without a costly inversion:
+    // affine_x == r  <=>  X == r * Z  (for a homogeneous projective point, Z != 0).
+    let matches_r = |point: ProjectivePoint| {
+        let z = point.z();
+        z != Felt::ZERO && point.x() == *r * z
+    };
+    Ok(matches_r(&zw_g + &rw_q) || matches_r(&zw_g - &rw_q))
+}
+
+/// Finish verification given the precomputed scalar inverse `w_residue = s^-1 mod n`.
+/// Recovers the public-key point first so error precedence matches stock `verify`
+/// (`InvalidPublicKey` before the `InvalidS` range check on `w`).
+fn verify_with_inverse(
+    public_key: &Felt,
+    message: &Felt,
+    r: &Felt,
+    w_residue: DynResidue<{ U256::LIMBS }>,
+) -> Result<bool, VerifyError> {
+    let public_key_point = recover_public_key_point(public_key)?;
+    verify_point_with_inverse(&public_key_point, message, r, w_residue)
+}
+
+/// Optimized drop-in for [`crate::verify`]. Returns the same boolean/errors.
+pub fn verify_fast(
+    public_key: &Felt,
+    message: &Felt,
+    r: &Felt,
+    s: &Felt,
+) -> Result<bool, VerifyError> {
+    check_ranges(message, r, s)?;
+    // Scalar-field arithmetic mod EC_ORDER via fixed-size Montgomery residues
+    // (crypto-bigint) instead of heap-allocating num-bigint. `s` is in [1, bound) and
+    // EC_ORDER is prime, so the inverse always exists.
+    let w_residue = DynResidue::new(&felt_to_u256(s), SCALAR_PARAMS).invert().0;
+    verify_with_inverse(public_key, message, r, w_residue)
+}
+
+/// Like [`verify_fast`], but takes the full public-key point, skipping the
+/// square-root y-recovery entirely (the single largest fixed cost of x-only
+/// verification). Either y sign yields the same result, since the final check
+/// tries both `+/-` candidates.
+///
+/// The point must be on the curve (as enforced by `AffinePoint::new`); the
+/// identity point is rejected as an invalid public key.
+pub fn verify_with_pubkey_point(
+    public_key_point: &AffinePoint,
+    message: &Felt,
+    r: &Felt,
+    s: &Felt,
+) -> Result<bool, VerifyError> {
+    check_ranges(message, r, s)?;
+    if public_key_point.is_identity() {
+        return Err(VerifyError::InvalidPublicKey);
+    }
+    let w_residue = DynResidue::new(&felt_to_u256(s), SCALAR_PARAMS).invert().0;
+    verify_point_with_inverse(public_key_point, message, r, w_residue)
+}
+
+/// Batch-verify many signatures `(public_key, message, r, s)`, returning a result
+/// per input in order. The one cost that amortizes across a batch is the scalar
+/// inverse `s^-1`: instead of one field inversion each, a single inversion plus
+/// `~2N` multiplies covers the whole batch (Montgomery's trick). The public-key
+/// square-root and the two scalar multiplications remain per-signature (they cannot
+/// be shared, and the STARK pubkey y-sign ambiguity rules out a single batched MSM).
+pub fn verify_batch(items: &[(Felt, Felt, Felt, Felt)]) -> Vec<Result<bool, VerifyError>> {
+    let one = DynResidue::new(&U256::ONE, SCALAR_PARAMS);
+
+    // Range-check each item; collect s-residues only for the valid ones.
+    let mut results: Vec<Result<bool, VerifyError>> = Vec::with_capacity(items.len());
+    let mut valid_positions = Vec::new();
+    let mut s_residues = Vec::new();
+    for (index, (_public_key, message, r, s)) in items.iter().enumerate() {
+        match check_ranges(message, r, s) {
+            Ok(()) => {
+                valid_positions.push(index);
+                s_residues.push(DynResidue::new(&felt_to_u256(s), SCALAR_PARAMS));
+                results.push(Ok(false)); // placeholder, overwritten below
+            }
+            Err(error) => results.push(Err(error)),
+        }
+    }
+
+    // Montgomery batch inversion of all valid `s` values.
+    let mut prefix = Vec::with_capacity(s_residues.len());
+    let mut running = one;
+    for s_residue in &s_residues {
+        running *= s_residue;
+        prefix.push(running);
+    }
+    let mut inverse = if s_residues.is_empty() { one } else { running.invert().0 };
+    let mut w_residues = vec![one; s_residues.len()];
+    for position in (0..s_residues.len()).rev() {
+        let preceding = if position == 0 { one } else { prefix[position - 1] };
+        w_residues[position] = inverse * preceding;
+        inverse *= &s_residues[position];
+    }
+
+    for (batch_index, &item_index) in valid_positions.iter().enumerate() {
+        let (public_key, message, r, _s) = &items[item_index];
+        results[item_index] =
+            verify_with_inverse(public_key, message, r, w_residues[batch_index]);
+    }
+    results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{get_public_key, rfc6979_generate_k, sign, verify};
+
+    /// Deterministic PRNG (splitmix64) so the fuzz cases are reproducible.
+    fn next_random(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A full-width field element (reduced mod p).
+    fn random_felt(state: &mut u64) -> Felt {
+        let mut bytes = [0u8; 32];
+        for chunk in bytes.chunks_mut(8) {
+            chunk.copy_from_slice(&next_random(state).to_le_bytes());
+        }
+        Felt::from_bytes_le(&bytes)
+    }
+
+    /// A value `< 2^248 < ELEMENT_UPPER_BOUND`, valid as a message / private key.
+    fn random_below_bound(state: &mut u64) -> Felt {
+        let mut bytes = [0u8; 32];
+        for index in 0..3 {
+            bytes[index * 8..index * 8 + 8].copy_from_slice(&next_random(state).to_le_bytes());
+        }
+        Felt::from_bytes_le(&bytes)
+    }
+
+    fn outcome(result: &Result<bool, VerifyError>) -> Option<bool> {
+        result.as_ref().ok().copied()
+    }
+
+    /// Tens of thousands of fully random `(pk, msg, r, s)` tuples: `verify_fast`
+    /// must agree with stock `verify` (almost all are Err or `false`). Random inputs
+    /// never hit the point-at-infinity edge (~2^-251), so stock does not panic here.
+    #[test]
+    fn fuzz_random_tuples_match_stock() {
+        let mut state = 0x5EED_0000_1234_ABCD;
+        for _ in 0..40_000 {
+            let public_key = random_felt(&mut state);
+            let message = random_felt(&mut state);
+            let r = random_felt(&mut state);
+            let s = random_felt(&mut state);
+            assert_eq!(
+                verify(&public_key, &message, &r, &s).ok(),
+                verify_fast(&public_key, &message, &r, &s).ok(),
+                "random tuple mismatch: pk={public_key:#x} msg={message:#x} r={r:#x} s={s:#x}"
+            );
+        }
+    }
+
+    /// Real signatures (must verify true) plus tampered variants (must verify false),
+    /// checked against stock `verify` and cross-checked through `verify_batch`.
+    #[test]
+    fn fuzz_real_signatures_match_stock_and_batch() {
+        let mut state = 0xABCD_0000_5EED_1234;
+        let mut batch_items = Vec::new();
+        let mut true_seen = 0u32;
+        let mut false_seen = 0u32;
+        for _ in 0..4_000 {
+            let private_key = random_below_bound(&mut state) + Felt::ONE; // nonzero
+            let message = random_below_bound(&mut state);
+            let public_key = get_public_key(&private_key);
+            let k = rfc6979_generate_k(&message, &private_key, None);
+            let sig = sign(&private_key, &message, &k).unwrap();
+
+            // Valid signature.
+            assert_eq!(outcome(&verify(&public_key, &message, &sig.r, &sig.s)), Some(true));
+            assert_eq!(verify_fast(&public_key, &message, &sig.r, &sig.s).ok(), Some(true));
+            true_seen += 1;
+            batch_items.push((public_key, message, sig.r, sig.s));
+
+            // Tampered variants must fail identically on both.
+            for tampered in [
+                (public_key, message + Felt::ONE, sig.r, sig.s),
+                (public_key, message, sig.r + Felt::ONE, sig.s),
+                (public_key, message, sig.r, sig.s + Felt::ONE),
+            ] {
+                let (pk, msg, r, s) = tampered;
+                assert_eq!(
+                    verify(&pk, &msg, &r, &s).ok(),
+                    verify_fast(&pk, &msg, &r, &s).ok(),
+                    "tampered mismatch"
+                );
+                if verify_fast(&pk, &msg, &r, &s).ok() == Some(false) {
+                    false_seen += 1;
+                }
+                batch_items.push(tampered);
+            }
+        }
+        assert!(true_seen > 0 && false_seen > 0, "expected both true and false outcomes");
+
+        // verify_batch must return the same per-item results as verify_fast.
+        let batch = verify_batch(&batch_items);
+        assert_eq!(batch.len(), batch_items.len());
+        for (index, (pk, msg, r, s)) in batch_items.iter().enumerate() {
+            assert_eq!(
+                outcome(&batch[index]),
+                verify_fast(pk, msg, r, s).ok(),
+                "batch vs verify_fast mismatch at {index}"
+            );
+        }
+    }
+
+    /// `verify_fast` must agree with stock `verify` (compared via `.ok()`, since
+    /// `VerifyError` is not `PartialEq`).
+    fn assert_parity(public_key: &Felt, message: &Felt, r: &Felt, s: &Felt) {
+        assert_eq!(
+            verify(public_key, message, r, s).ok(),
+            verify_fast(public_key, message, r, s).ok(),
+            "verify_fast diverged: pk={public_key:#x} msg={message:#x} r={r:#x} s={s:#x}"
+        );
+    }
+
+    #[test]
+    fn matches_stock_verify_on_valid_and_tampered() {
+        let salt = Felt::from_hex("0x3c1e9550e66958296d11b60f8e8e7a7").unwrap();
+        for i in 1u64..=32 {
+            let private_key = Felt::from(i) * salt;
+            let message = Felt::from(i.wrapping_mul(0xabcdef).wrapping_add(7));
+            let public_key = get_public_key(&private_key);
+            let k = rfc6979_generate_k(&message, &private_key, None);
+            let sig = sign(&private_key, &message, &k).unwrap();
+
+            assert_eq!(verify_fast(&public_key, &message, &sig.r, &sig.s).ok(), Some(true));
+            assert_parity(&public_key, &message, &sig.r, &sig.s);
+            assert_parity(&public_key, &(message + Felt::ONE), &sig.r, &sig.s);
+            assert_parity(&public_key, &message, &(sig.r + Felt::ONE), &sig.s);
+            assert_parity(&public_key, &message, &sig.r, &(sig.s + Felt::ONE));
+        }
+    }
+
+    #[test]
+    fn cipolla_sqrt_matches_stock_and_rejects_non_residues() {
+        let mut non_residue_seen = false;
+        for i in 1u64..=500 {
+            let value = Felt::from(i);
+            match stark_sqrt(&value) {
+                Some(root) => {
+                    assert_eq!(root * root, value, "sqrt({i}) is not a root");
+                    // Stock `Felt::sqrt` agrees a root exists (may be the other sign).
+                    let stock = value.sqrt().expect("stock sqrt should also find a root");
+                    assert!(root == stock || root == -stock, "root/sign mismatch for {i}");
+                }
+                None => {
+                    non_residue_seen = true;
+                    assert!(value.sqrt().is_none(), "stock found a root where Cipolla did not ({i})");
+                }
+            }
+        }
+        assert!(non_residue_seen, "expected some non-residues in 1..=500");
+    }
+
+    #[test]
+    fn batch_matches_per_item_verify() {
+        let salt = Felt::from_hex("0x3c1e9550e66958296d11b60f8e8e7a7").unwrap();
+        let mut items = Vec::new();
+        for i in 1u64..=40 {
+            let private_key = Felt::from(i) * salt;
+            let message = Felt::from(i.wrapping_mul(0x1234567) + 3);
+            let public_key = get_public_key(&private_key);
+            let k = rfc6979_generate_k(&message, &private_key, None);
+            let sig = sign(&private_key, &message, &k).unwrap();
+            items.push((public_key, message, sig.r, sig.s));
+        }
+        // A tampered (valid-range but wrong) signature and an out-of-range one.
+        items.push((items[0].0, items[0].1 + Felt::ONE, items[0].2, items[0].3));
+        items.push((get_public_key(&Felt::from(9u64)), Felt::from(3u64), Felt::from(5u64), Felt::ZERO));
+
+        let batch = verify_batch(&items);
+        assert_eq!(batch.len(), items.len());
+        for (index, (public_key, message, r, s)) in items.iter().enumerate() {
+            assert_eq!(
+                batch[index].as_ref().ok().copied(),
+                verify_fast(public_key, message, r, s).ok(),
+                "batch[{index}] disagrees with verify_fast"
+            );
+        }
+    }
+
+    /// The Jacobian wNAF multiply must agree with the generic types-core
+    /// double-and-add (`&ProjectivePoint * Felt`) on random and edge scalars.
+    #[test]
+    fn jacobian_windowed_mul_matches_generic() {
+        let mut state = 0xC0FF_EE00_DEAD_BEEF;
+        let point = AffinePoint::new_from_x(&get_public_key(&Felt::from(7u64)), true).unwrap();
+        let point_proj = ProjectivePoint::from_affine(point.x(), point.y()).unwrap();
+
+        let mut scalars: Vec<Felt> = (0..64).map(|_| random_felt(&mut state)).collect();
+        scalars.extend([
+            Felt::ZERO,
+            Felt::ONE,
+            Felt::TWO,
+            Felt::THREE,
+            Felt::from(15u64),  // largest single wNAF digit
+            Felt::from(16u64),  // smallest two-digit case
+            Felt::MAX,
+        ]);
+        for scalar in scalars {
+            let via_jacobian = windowed_mul(&point, &scalar);
+            let via_generic = &point_proj * scalar;
+            // Compare in affine (either representation may differ projectively).
+            match (via_jacobian.to_affine(), via_generic.to_affine()) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.x(), b.x(), "x mismatch for scalar {scalar:#x}");
+                    assert_eq!(a.y(), b.y(), "y mismatch for scalar {scalar:#x}");
+                }
+                (Err(_), Err(_)) => {} // both infinity (scalar == 0 mod order)
+                _ => panic!("infinity disagreement for scalar {scalar:#x}"),
+            }
+        }
+    }
+
+    /// `verify_with_pubkey_point` must agree with `verify_fast` for either y sign
+    /// of the public-key point, on valid and tampered signatures.
+    #[test]
+    fn with_point_matches_x_only_for_both_y_signs() {
+        let mut state = 0x0123_4567_89AB_CDEF;
+        for _ in 0..200 {
+            let private_key = random_below_bound(&mut state) + Felt::ONE;
+            let message = random_below_bound(&mut state);
+            let public_key = get_public_key(&private_key);
+            let k = rfc6979_generate_k(&message, &private_key, None);
+            let sig = sign(&private_key, &message, &k).unwrap();
+
+            for y_parity in [false, true] {
+                let point = AffinePoint::new_from_x(&public_key, y_parity).unwrap();
+                assert_eq!(
+                    verify_with_pubkey_point(&point, &message, &sig.r, &sig.s).ok(),
+                    Some(true),
+                    "valid signature must verify with y_parity={y_parity}"
+                );
+                assert_eq!(
+                    verify_with_pubkey_point(&point, &(message + Felt::ONE), &sig.r, &sig.s).ok(),
+                    verify_fast(&public_key, &(message + Felt::ONE), &sig.r, &sig.s).ok(),
+                    "tampered mismatch with y_parity={y_parity}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn with_point_rejects_identity() {
+        let result = verify_with_pubkey_point(
+            &AffinePoint::identity(),
+            &Felt::from(2u64),
+            &Felt::from(3u64),
+            &Felt::from(5u64),
+        );
+        assert!(matches!(result, Err(VerifyError::InvalidPublicKey)));
+    }
+
+    #[test]
+    fn rejects_out_of_range_r_and_s() {
+        let public_key = get_public_key(&Felt::from(42u64));
+        let message = Felt::from(7u64);
+        assert!(verify_fast(&public_key, &message, &Felt::ZERO, &Felt::from(5u64)).is_err());
+        assert!(verify_fast(&public_key, &message, &Felt::from(5u64), &Felt::ZERO).is_err());
+    }
+
+    /// Input (from an adversarial audit) where a candidate `z*w*G + r*w*Q` is the
+    /// point at infinity. Stock `verify` panics here via `.to_affine().unwrap()`;
+    /// the optimized path must return `Ok(false)` (infinity has no affine x = r).
+    #[test]
+    fn infinity_candidate_returns_false_instead_of_panicking() {
+        let public_key =
+            Felt::from_hex("0x21a9091974fd58a932db290fecf11467845ed7108993da01c0849ec2876347b")
+                .unwrap();
+        let message = Felt::from_hex("0x1").unwrap();
+        let r = Felt::from_hex("0x3a282f8608e46c64df4a40eb3e8249500f73e9cc5cb5288f2845d06a57209d6")
+            .unwrap();
+        let s = Felt::from_hex("0x9e3779b97f4a7c15").unwrap();
+        assert_eq!(verify_fast(&public_key, &message, &r, &s).ok(), Some(false));
+    }
+}
