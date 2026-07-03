@@ -822,4 +822,225 @@ mod tests {
         let s = Felt::from_hex("0x9e3779b97f4a7c15").unwrap();
         assert_eq!(verify_fast(&public_key, &message, &r, &s).ok(), Some(false));
     }
+
+    // Known-answer tests below check EXACT intermediate values against reference
+    // vectors computed with an independent pure-Python integer-arithmetic
+    // implementation of the curve group law (no lambdaworks, no Rust) -- so a
+    // shared bug between this module and stock `verify` cannot hide behind
+    // boolean parity.
+
+    fn affine(x_hex: &str, y_hex: &str) -> AffinePoint {
+        AffinePoint::new(Felt::from_hex(x_hex).unwrap(), Felt::from_hex(y_hex).unwrap()).unwrap()
+    }
+
+    fn assert_point_eq(point: &ProjectivePoint, expected: &AffinePoint, label: &str) {
+        let actual = point.to_affine().unwrap_or_else(|_| panic!("{label}: unexpected infinity"));
+        assert_eq!(actual.x(), expected.x(), "{label}: x mismatch");
+        assert_eq!(actual.y(), expected.y(), "{label}: y mismatch");
+    }
+
+    const TWO_G_X: &str = "0x0759ca09377679ecd535a81e83039658bf40959283187c654c5416f439403cf5";
+    const TWO_G_Y: &str = "0x06f524a3400e7708d5c01a28598ad272e7455aa88778b19f93b562d7a9646c41";
+    const THREE_G_X: &str = "0x0411494b501a98abd8262b0da1351e17899a0c4ef23dd2f96fec5ba847310b20";
+    const THREE_G_Y: &str = "0x07e1b3ebac08924d2c26f409549191fcf94f3bf6f301ed3553e22dfb802f0686";
+    const FULL_SCALAR: &str = "0x6f2a1b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081920304050607";
+    const FULL_G_X: &str = "0x02e503ed721a7e6406cbff41ae74afe4ee3d2d8235b4e0f597412fd585778bef";
+    const FULL_G_Y: &str = "0x01f0e92fae4b108704126e9ee49e9f70af474c672b2d6bdee3de64ca48e803e2";
+    const ORDER_MINUS_1_G_X: &str =
+        "0x01ef15c18599971b7beced415a40f0c7deacfd9b0d1819e03d723d8bc943cfca";
+    const ORDER_MINUS_1_G_Y: &str =
+        "0x07a997f9f55b68e04841b7fe20b9139d21ac132ee541bc5cd78cfff3c91723e2";
+    const Q7_X: &str = "0x0743829e0a179f8afe223fc8112dfc8d024ab6b235fd42283c4f5970259ce7b7";
+    const Q7_Y: &str = "0x00e67a0a63cc493225e45b9178a3375596ea2a1d7012628a328dbc14c78cd1b7";
+    const FULL_Q7_X: &str = "0x013b66d2f5923d8afcea8b11b4a332267078e34c90fd3c89a5d8a6a2b19c6f9d";
+    const FULL_Q7_Y: &str = "0x077e395dea214800b20677f3cfb38c8d9bc90a9986891b9c85e259ea3b51d4e6";
+    const SEVENTEEN_Q7_X: &str =
+        "0x05e872efefb53f900c760c1aabbe209be5a137d6151e8d75ce307bcd8aedd74d";
+    const SEVENTEEN_Q7_Y: &str =
+        "0x01521ae45572e09815dc73040f6845b7fd6cae2579ce5c7d162fd96a0355d198";
+
+    /// STARK curve order (= EC_ORDER), for n*P = infinity and (n-1)*G checks.
+    const CURVE_ORDER: &str = "0x0800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f";
+
+    #[test]
+    fn jacobian_double_and_add_match_independent_reference() {
+        let generator = AffinePoint::generator();
+        let g_jacobian = JacobianPoint::from_affine_point(&generator);
+
+        let two_g = g_jacobian.double();
+        assert_point_eq(&two_g.to_homogeneous(), &affine(TWO_G_X, TWO_G_Y), "2G = double(G)");
+
+        let three_g_via_add = two_g.add(&g_jacobian);
+        assert_point_eq(
+            &three_g_via_add.to_homogeneous(),
+            &affine(THREE_G_X, THREE_G_Y),
+            "3G = 2G + G",
+        );
+
+        // Doubling-branch of `add` (equal operands) must agree with `double`.
+        let four_g_via_add = two_g.add(&two_g);
+        let four_g_via_double = two_g.double();
+        assert_point_eq(
+            &four_g_via_add.to_homogeneous(),
+            &four_g_via_double.to_homogeneous().to_affine().unwrap(),
+            "add(P,P) == double(P)",
+        );
+
+        // P + (-P) must be infinity.
+        let cancelled = g_jacobian.add(&g_jacobian.neg());
+        assert!(cancelled.to_homogeneous().to_affine().is_err(), "G + (-G) must be infinity");
+    }
+
+    #[test]
+    fn fixed_base_mul_known_answers() {
+        let generator = AffinePoint::generator();
+        assert_point_eq(&fixed_base_mul(&Felt::ONE), &generator, "1*G");
+        assert_point_eq(&fixed_base_mul(&Felt::TWO), &affine(TWO_G_X, TWO_G_Y), "2*G");
+        assert_point_eq(&fixed_base_mul(&Felt::THREE), &affine(THREE_G_X, THREE_G_Y), "3*G");
+        assert_point_eq(
+            &fixed_base_mul(&Felt::from_hex(FULL_SCALAR).unwrap()),
+            &affine(FULL_G_X, FULL_G_Y),
+            "full-width scalar * G",
+        );
+
+        let order = Felt::from_hex(CURVE_ORDER).unwrap();
+        assert_point_eq(
+            &fixed_base_mul(&(order - Felt::ONE)),
+            &affine(ORDER_MINUS_1_G_X, ORDER_MINUS_1_G_Y),
+            "(n-1)*G",
+        );
+        assert!(fixed_base_mul(&order).to_affine().is_err(), "n*G must be infinity");
+    }
+
+    #[test]
+    fn windowed_mul_known_answers() {
+        let q7 = affine(Q7_X, Q7_Y);
+        assert_point_eq(&windowed_mul(&q7, &Felt::ONE), &q7, "1*Q");
+        assert_point_eq(
+            &windowed_mul(&q7, &Felt::from(17u64)),
+            &affine(SEVENTEEN_Q7_X, SEVENTEEN_Q7_Y),
+            "17*Q",
+        );
+        assert_point_eq(
+            &windowed_mul(&q7, &Felt::from_hex(FULL_SCALAR).unwrap()),
+            &affine(FULL_Q7_X, FULL_Q7_Y),
+            "full-width scalar * Q",
+        );
+
+        // n*Q reaches infinity through the H == 0, r != 0 special case of `add`
+        // on the final digit; the result must be the point at infinity.
+        let order = Felt::from_hex(CURVE_ORDER).unwrap();
+        assert!(windowed_mul(&q7, &order).to_affine().is_err(), "n*Q must be infinity");
+    }
+
+    #[test]
+    fn stark_sqrt_known_answers() {
+        // value = k^2 mod p for a hardcoded k: the root must be exactly k or p-k.
+        let value = Felt::from_hex(
+            "0x03588e3f38a9e4f752b22bd4eb778d58e2d0a23b68c8b1c05d83ff6cd8ab9d04",
+        )
+        .unwrap();
+        let root_a = Felt::from_hex(
+            "0x03c1e9550e66958296d11b60f8e8e7a7ad990d07fa65d5f7652c4a6c87d4e3cc",
+        )
+        .unwrap();
+        let root_b = Felt::from_hex(
+            "0x043e16aaf1996a8e692ee49f071718585266f2f8059a2a089ad3b593782b1c35",
+        )
+        .unwrap();
+        let root = stark_sqrt(&value).expect("value is a residue");
+        assert!(root == root_a || root == root_b, "sqrt returned {root:#x}");
+
+        // 9 = 3^2: roots are exactly {3, p-3}.
+        let root_of_nine = stark_sqrt(&Felt::from(9u64)).expect("9 is a residue");
+        assert!(
+            root_of_nine == Felt::THREE || root_of_nine == -Felt::THREE,
+            "sqrt(9) returned {root_of_nine:#x}"
+        );
+
+        // 3 is a non-residue mod p (3^((p-1)/2) == p - 1, verified independently).
+        assert!(stark_sqrt(&Felt::THREE).is_none(), "3 must have no square root");
+
+        assert_eq!(stark_sqrt(&Felt::ZERO), Some(Felt::ZERO));
+        let root_of_one = stark_sqrt(&Felt::ONE).expect("1 is a residue");
+        assert!(root_of_one == Felt::ONE || root_of_one == -Felt::ONE);
+    }
+
+    #[test]
+    fn wnaf_digits_reconstruct_scalar_exactly() {
+        let scalars = [
+            Felt::ONE,
+            Felt::from(15u64),
+            Felt::from(16u64),
+            Felt::from(17u64),
+            Felt::from_hex(FULL_SCALAR).unwrap(),
+            Felt::from_hex(CURVE_ORDER).unwrap() - Felt::ONE,
+            Felt::MAX,
+        ];
+        for scalar in scalars {
+            let digits = wnaf(&scalar, WINDOW);
+            // Reconstruct sum(digit_i * 2^i) in the field; every scalar < p, so
+            // exact equality in Felt implies exact integer equality.
+            let mut reconstructed = Felt::ZERO;
+            let mut power = Felt::ONE;
+            for &digit in &digits {
+                if digit > 0 {
+                    reconstructed = reconstructed + power * Felt::from(digit as u64);
+                } else if digit < 0 {
+                    reconstructed = reconstructed - power * Felt::from((-digit) as u64);
+                }
+                power = power + power;
+            }
+            assert_eq!(reconstructed, scalar, "wNAF digits do not reconstruct scalar");
+
+            for (index, &digit) in digits.iter().enumerate() {
+                if digit != 0 {
+                    assert!(digit % 2 != 0, "wNAF digit at {index} must be odd");
+                    assert!(digit.abs() < 16, "wNAF digit at {index} out of range");
+                    // Width-5 window property: the next 4 digits must be zero.
+                    for offset in 1..WINDOW as usize {
+                        if let Some(&next) = digits.get(index + offset) {
+                            assert_eq!(next, 0, "window property violated at {index}+{offset}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_inverse_known_answer() {
+        // w = s^-1 mod n for a hardcoded s, expected value computed independently.
+        let s_value = Felt::from_hex(
+            "0x0405c3191ab3883ef2b763af35bc5f5d15b3b4e99461d70e84c654a351a7c81b",
+        )
+        .unwrap();
+        let expected_w = Felt::from_hex(
+            "0x01ce0310e48aa17f713cbd8f8acc5a88703a359d2ef27d33ef95b8cfce4bcc91",
+        )
+        .unwrap();
+        let w_residue = DynResidue::new(&felt_to_u256(&s_value), SCALAR_PARAMS).invert().0;
+        assert_eq!(u256_to_felt(&w_residue.retrieve()), expected_w);
+    }
+
+    /// Every private-key -> public-key pair in the StarkEx precomputed vectors
+    /// (generated by starkware's original tooling, independent of this crate)
+    /// must match `fixed_base_mul`'s x-coordinate exactly.
+    #[test]
+    fn fixed_base_mul_matches_precomputed_starkex_keys() {
+        let json_data = include_str!("../test-data/keys_precomputed.json");
+        let key_map: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(json_data).expect("parse keys_precomputed.json");
+        assert!(!key_map.is_empty());
+        for (private_key, expected_public_key) in key_map {
+            let public_key_point = fixed_base_mul(&Felt::from_hex(&private_key).unwrap())
+                .to_affine()
+                .expect("private key must not map to infinity");
+            assert_eq!(
+                public_key_point.x(),
+                Felt::from_hex(&expected_public_key).unwrap(),
+                "fixed_base_mul mismatch for private key {private_key}"
+            );
+        }
+    }
 }

@@ -3,7 +3,7 @@
 //! exact hash) is verified.
 //!
 //! Full matrix: {stock verify, verify_fast, verify_with_pubkey_point}
-//!            x {Poseidon(10 felts), blake2s(320-byte packed order)}.
+//!            x {Poseidon(10 felts), blake2s(10 felts, Cairo encoding)}.
 //!
 //! Every arm verifies a REAL signature over the arm's own hash domain and
 //! asserts the result is `true` inside the timed loop, so no arm can pass
@@ -24,19 +24,39 @@ const TRIALS: usize = 8;
 const THREAD_TRIALS: usize = 5;
 const ORDER_FIELDS: usize = 10;
 
-/// blake2s over the packed 320-byte order (10 felts, big-endian), reduced to a
-/// canonical felt below the ECDSA message bound by clearing the top 6 bits.
+/// blake2s over the 10 order felts using Starknet's Cairo-compatible encoding
+/// (starkware cairo_blake2s / starknet-types-core `Blake2Felt252`): each felt
+/// encodes as 2 u32 words if < 2^63 or 8 u32 words with an MSB marker otherwise;
+/// words serialize little-endian; the 256-bit digest packs into a Felt (mod p).
 fn blake_hash_fields(fields: &[Felt; ORDER_FIELDS]) -> Felt {
     use blake2::{Blake2s256, Digest};
-    let mut hasher = Blake2s256::new();
+    const SMALL_THRESHOLD: Felt = Felt::from_hex_unchecked("0x8000000000000000");
+    const BIG_MARKER: u32 = 1 << 31;
+
+    let mut words: Vec<u32> = Vec::with_capacity(ORDER_FIELDS * 8);
     for field in fields {
-        hasher.update(field.to_bytes_be());
+        let bytes = field.to_bytes_be();
+        if *field < SMALL_THRESHOLD {
+            words.push(u32::from_be_bytes(bytes[24..28].try_into().unwrap()));
+            words.push(u32::from_be_bytes(bytes[28..32].try_into().unwrap()));
+        } else {
+            let start = words.len();
+            for chunk in bytes.chunks_exact(4) {
+                words.push(u32::from_be_bytes(chunk.try_into().unwrap()));
+            }
+            words[start] |= BIG_MARKER;
+        }
     }
+    let mut byte_stream = Vec::with_capacity(words.len() * 4);
+    for word in words {
+        byte_stream.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut hasher = Blake2s256::new();
+    hasher.update(&byte_stream);
     let digest = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&digest);
-    bytes[0] &= 0x03;
-    Felt::from_bytes_be(&bytes)
+    let mut le_bytes = [0u8; 32];
+    le_bytes.copy_from_slice(&digest);
+    Felt::from_bytes_le(&le_bytes)
 }
 
 struct Order {
@@ -105,7 +125,7 @@ fn main() {
             black_box(poseidon_hash_many(&o.fields));
             true
         })),
-        ("blake2s(320-byte packed order) alone", Box::new(|o: &Order| {
+        ("blake2s(10 felts, Cairo encoding) alone", Box::new(|o: &Order| {
             black_box(blake_hash_fields(&o.fields));
             true
         })),
