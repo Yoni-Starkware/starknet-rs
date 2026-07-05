@@ -8,7 +8,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use starknet_crypto::{
-    get_public_key, rfc6979_generate_k, sign, verify, verify_batch_with_nonce_points, verify_fast,
+    get_public_key, rfc6979_generate_k, sign, verify, verify_batch_with_nonce_parity, verify_batch_with_nonce_points, verify_fast,
     verify_with_pubkey_point, Felt,
 };
 use starknet_types_core::curve::AffinePoint;
@@ -117,5 +117,25 @@ fn main() {
             best * 1e6,
             with_point / best
         );
+    }
+
+    // Parity-bit variant: R lifted internally via one Cipolla sqrt per signature.
+    let parity_items: Vec<(AffinePoint, Felt, Felt, bool, Felt)> = batch_items
+        .iter()
+        .map(|(q, msg, nonce, s)| {
+            (q.clone(), *msg, nonce.x(), nonce.y().to_bytes_le()[0] & 1 == 1, *s)
+        })
+        .collect();
+    println!("batch MSM verify, parity-bit wire format (internal sqrt lift):");
+    for batch_size in [256usize, 1024] {
+        let subset = &parity_items[..batch_size];
+        assert_eq!(verify_batch_with_nonce_parity(subset, &seed).ok(), Some(true));
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            assert!(verify_batch_with_nonce_parity(subset, &seed).unwrap());
+            best = best.min(start.elapsed().as_secs_f64() / batch_size as f64);
+        }
+        println!("  N={batch_size:<5} {:>7.2} us/sig", best * 1e6);
     }
 }

@@ -527,7 +527,7 @@ pub fn verify_with_pubkey_point(
     s: &Felt,
 ) -> Result<bool, VerifyError> {
     check_ranges(message, r, s)?;
-    if public_key_point.is_identity() {
+    if public_key_point.is_identity() || !is_on_curve(public_key_point) {
         return Err(VerifyError::InvalidPublicKey);
     }
     let w_residue = DynResidue::new(&felt_to_u256(s), SCALAR_PARAMS).invert().0;
@@ -579,6 +579,14 @@ pub fn verify_batch(items: &[(Felt, Felt, Felt, Felt)]) -> Vec<Result<bool, Veri
             verify_with_inverse(public_key, message, r, w_residues[batch_index]);
     }
     results
+}
+
+/// Whether the affine point satisfies `y^2 = x^3 + ALPHA*x + BETA`. Points
+/// arriving from the wire must be validated to rule out invalid-curve attacks.
+fn is_on_curve(point: &AffinePoint) -> bool {
+    let x = point.x();
+    let y = point.y();
+    y * y == x * x * x + ALPHA * x + BETA
 }
 
 /// Window width for the batch Pippenger MSM, by term count.
@@ -663,8 +671,11 @@ pub fn verify_batch_with_nonce_points(
     let one = DynResidue::new(&U256::ONE, SCALAR_PARAMS);
     let mut s_residues = Vec::with_capacity(items.len());
     for (public_key_point, message, nonce_point, s) in items {
-        if public_key_point.is_identity() || nonce_point.is_identity() {
+        if public_key_point.is_identity() || !is_on_curve(public_key_point) {
             return Err(VerifyError::InvalidPublicKey);
+        }
+        if nonce_point.is_identity() || !is_on_curve(nonce_point) {
+            return Err(VerifyError::InvalidR);
         }
         check_ranges(message, &nonce_point.x(), s)?;
         s_residues.push(DynResidue::new(&felt_to_u256(s), SCALAR_PARAMS));
@@ -727,6 +738,30 @@ pub fn verify_batch_with_nonce_points(
     // The combination sums to the identity iff every equation holds.
     let combination = pippenger_msm(&scalars, &points);
     Ok(combination.to_affine().is_err())
+}
+
+/// Like [`verify_batch_with_nonce_points`], but each signature carries only the
+/// classic `r` plus the y-parity bit of its nonce point (`+1 bit` on the wire
+/// instead of `+32 bytes`). The full `R` is lifted here with one Cipolla square
+/// root per signature (square roots, unlike inversions, cannot be batched), so
+/// this costs ~16 us/signature more than the full-point variant.
+///
+/// Items are `(public_key_point, message, r, nonce_y_is_odd, s)`.
+pub fn verify_batch_with_nonce_parity(
+    items: &[(AffinePoint, Felt, Felt, bool, Felt)],
+    random_seed: &[u8; 32],
+) -> Result<bool, VerifyError> {
+    let mut resolved = Vec::with_capacity(items.len());
+    for (public_key_point, message, r, nonce_y_is_odd, s) in items {
+        check_ranges(message, r, s)?;
+        let y_squared = r.square() * r + ALPHA * r + BETA;
+        let root = stark_sqrt(&y_squared).ok_or(VerifyError::InvalidR)?;
+        let root_is_odd = root.to_bytes_le()[0] & 1 == 1;
+        let y = if root_is_odd == *nonce_y_is_odd { root } else { -root };
+        let nonce_point = AffinePoint::new(*r, y).map_err(|_| VerifyError::InvalidR)?;
+        resolved.push((public_key_point.clone(), *message, nonce_point, *s));
+    }
+    verify_batch_with_nonce_points(&resolved, random_seed)
 }
 
 #[cfg(test)]
@@ -1327,6 +1362,56 @@ mod tests {
         let mut bad_range = items[..4].to_vec();
         bad_range[2].3 = Felt::ZERO;
         assert!(verify_batch_with_nonce_points(&bad_range, &seed).is_err());
+    }
+
+    /// Off-curve wire points must be rejected, and the parity-bit batch variant
+    /// must agree with the full-point variant.
+    #[test]
+    fn batch_rejects_off_curve_points_and_parity_variant_matches() {
+        let seed = [9u8; 32];
+        let mut state = 0x0FFC_0000_C0DE_0001u64;
+        let mut point_items = Vec::new();
+        let mut parity_items = Vec::new();
+        for _ in 0..24 {
+            let private_key = random_below_bound(&mut state) + Felt::ONE;
+            let message = random_below_bound(&mut state);
+            let k = rfc6979_generate_k(&message, &private_key, None);
+            let signature = sign(&private_key, &message, &k).unwrap();
+            let nonce_point = fixed_base_mul(&k).to_affine().unwrap();
+            let public_key_point = fixed_base_mul(&private_key).to_affine().unwrap();
+            let nonce_y_is_odd = nonce_point.y().to_bytes_le()[0] & 1 == 1;
+            parity_items.push((
+                public_key_point.clone(),
+                message,
+                nonce_point.x(),
+                nonce_y_is_odd,
+                signature.s,
+            ));
+            point_items.push((public_key_point, message, nonce_point, signature.s));
+        }
+        assert_eq!(verify_batch_with_nonce_points(&point_items, &seed).ok(), Some(true));
+        assert_eq!(verify_batch_with_nonce_parity(&parity_items, &seed).ok(), Some(true));
+
+        // Wrong parity bit flips R and must fail.
+        let mut wrong_parity = parity_items.clone();
+        wrong_parity[5].3 = !wrong_parity[5].3;
+        assert_eq!(verify_batch_with_nonce_parity(&wrong_parity, &seed).ok(), Some(false));
+
+        // Off-curve nonce point (y tweaked) must be rejected as InvalidR.
+        let mut off_curve = point_items.clone();
+        let broken = AffinePoint::new_unchecked(off_curve[2].2.x(), off_curve[2].2.y() + Felt::ONE);
+        off_curve[2].2 = broken;
+        assert!(matches!(
+            verify_batch_with_nonce_points(&off_curve, &seed),
+            Err(VerifyError::InvalidR)
+        ));
+
+        // Off-curve public key must be rejected on both single and batch paths.
+        let bad_key = AffinePoint::new_unchecked(point_items[0].0.x(), point_items[0].0.y() + Felt::ONE);
+        assert!(matches!(
+            verify_with_pubkey_point(&bad_key, &point_items[0].1, &point_items[0].2.x(), &point_items[0].3),
+            Err(VerifyError::InvalidPublicKey)
+        ));
     }
 
     /// Every private-key -> public-key pair in the StarkEx precomputed vectors
