@@ -592,8 +592,9 @@ fn is_on_curve(point: &AffinePoint) -> bool {
 /// Window width for the batch Pippenger MSM, by term count.
 fn pippenger_window(term_count: usize) -> usize {
     match term_count {
-        0..=256 => 7,
-        257..=1024 => 8,
+        0..=512 => 6,
+        513..=1024 => 7,
+        1025..=2048 => 8,
         _ => 9,
     }
 }
@@ -693,21 +694,21 @@ pub fn verify_batch_with_nonce_points(
         inverse *= &s_residues[index];
     }
 
-    // Random 128-bit coefficients derived from the seed (delta_0 = 1).
-    let seed_low = Felt::from_bytes_be_slice(&random_seed[..16]);
-    let seed_high = Felt::from_bytes_be_slice(&random_seed[16..]);
-
     let mut scalars = Vec::with_capacity(2 * items.len() + 1);
     let mut points = Vec::with_capacity(2 * items.len() + 1);
     let mut g_coefficient = DynResidue::new(&U256::ZERO, SCALAR_PARAMS);
     for (index, (public_key_point, message, nonce_point, _s)) in items.iter().enumerate() {
+        // Random 128-bit coefficient from a SHA-256 stream over the seed
+        // (delta_0 = 1); ~30x cheaper per item than a Poseidon derivation.
         let delta_residue = if index == 0 {
             one
         } else {
-            let digest = crate::poseidon_hash_many(&[seed_low, seed_high, Felt::from(index as u64)]);
-            let mut delta_bytes = [0u8; 16];
-            delta_bytes.copy_from_slice(&digest.to_bytes_be()[16..]);
-            DynResidue::new(&felt_to_u256(&Felt::from_bytes_be_slice(&delta_bytes)), SCALAR_PARAMS)
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(random_seed);
+            hasher.update((index as u64).to_be_bytes());
+            let digest = hasher.finalize();
+            DynResidue::new(&felt_to_u256(&Felt::from_bytes_be_slice(&digest[..16])), SCALAR_PARAMS)
         };
         let w_residue = w_residues[index];
 
@@ -1357,6 +1358,18 @@ mod tests {
         let mut flipped_nonce = items.clone();
         flipped_nonce[3].2 = -&flipped_nonce[3].2;
         assert_eq!(verify_batch_with_nonce_points(&flipped_nonce, &seed).ok(), Some(false));
+
+        // An invalid item mid-batch must error (exercises index remapping),
+        // and values at exactly the range bound must match stock semantics.
+        let mut mid_invalid = items.clone();
+        mid_invalid[1].3 = Felt::ZERO;
+        assert!(verify_batch_with_nonce_points(&mid_invalid, &seed).is_err());
+        let bound = ELEMENT_UPPER_BOUND;
+        assert!(verify_fast(&items[0].0.x(), &bound, &Felt::ONE, &Felt::ONE).is_err());
+        assert_eq!(
+            verify(&items[0].0.x(), &bound, &Felt::ONE, &Felt::ONE).ok(),
+            verify_fast(&items[0].0.x(), &bound, &Felt::ONE, &Felt::ONE).ok()
+        );
 
         // Empty batch is vacuously valid; range violations error out.
         assert_eq!(verify_batch_with_nonce_points(&[], &seed).ok(), Some(true));
