@@ -636,9 +636,8 @@ fn pippenger_msm(scalars: &[U256], points: &[AffinePoint]) -> ProjectivePoint {
 }
 
 /// Probabilistic all-or-nothing batch verification of ECDSA signatures whose
-/// full nonce point `R` is transmitted alongside `(s)` (the classic `r` is
-/// derived here as `x(R) mod n`, handling the rare `x >= n` case exactly like
-/// the scalar reduction in signing).
+/// full nonce point `R` is transmitted alongside `s`; the classic `r` is
+/// `x(R)`, range-checked below `2^251` exactly as stock signing guarantees.
 ///
 /// Each item is `(public_key_point, message, nonce_point, s)`. Verifies the
 /// exact group equation `(z*w)*G + (r*w)*Q == R` for every item at once via a
@@ -712,12 +711,10 @@ pub fn verify_batch_with_nonce_points(
         };
         let w_residue = w_residues[index];
 
-        // r = x(R) mod n, then the stock range checks on the reduced value.
+        // r = x(R): `check_ranges` above already enforced r < 2^251 < n, the
+        // same convention stock signing guarantees, so no mod-n reduction is
+        // needed here.
         let r_residue = DynResidue::new(&felt_to_u256(&nonce_point.x()), SCALAR_PARAMS);
-        let r_reduced = u256_to_felt(&r_residue.retrieve());
-        if r_reduced == Felt::ZERO || r_reduced >= ELEMENT_UPPER_BOUND {
-            return Err(VerifyError::InvalidR);
-        }
         let w_value = u256_to_felt(&w_residue.retrieve());
         if w_value == Felt::ZERO || w_value >= ELEMENT_UPPER_BOUND {
             return Err(VerifyError::InvalidS);
@@ -755,7 +752,11 @@ pub fn verify_batch_with_nonce_parity(
     for (public_key_point, message, r, nonce_y_is_odd, s) in items {
         check_ranges(message, r, s)?;
         let y_squared = r.square() * r + ALPHA * r + BETA;
-        let root = stark_sqrt(&y_squared).ok_or(VerifyError::InvalidR)?;
+        // A non-liftable r is not the x-coordinate of any curve point: the
+        // signature is invalid (stock verify would return false), not malformed.
+        let Some(root) = stark_sqrt(&y_squared) else {
+            return Ok(false);
+        };
         let root_is_odd = root.to_bytes_le()[0] & 1 == 1;
         let y = if root_is_odd == *nonce_y_is_odd { root } else { -root };
         let nonce_point = AffinePoint::new(*r, y).map_err(|_| VerifyError::InvalidR)?;
