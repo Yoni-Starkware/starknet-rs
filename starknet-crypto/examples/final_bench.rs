@@ -1,6 +1,8 @@
-//! Final apples-to-apples benchmark: stock `verify` vs optimized `verify_fast`,
-//! averaged over many diverse valid signatures (varied keys and messages) so the
-//! result is not tied to one input. Reports the min over several trials.
+//! Apples-to-apples benchmark of all verification paths: stock `verify`,
+//! `verify_fast` (x-only drop-in), `verify_with_pubkey_point` (full public
+//! key), and `verify_batch_with_nonce_points` (Pippenger MSM batch), averaged
+//! over many diverse valid signatures (varied keys and messages) so the result
+//! is not tied to one input. Reports the min over several trials.
 
 use std::hint::black_box;
 use std::time::Instant;

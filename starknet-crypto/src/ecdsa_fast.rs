@@ -1,14 +1,51 @@
 //! Optimized STARK-curve ECDSA verification.
 //!
-//! Same result as [`crate::verify`], but replaces the two independent binary
-//! double-and-add scalar multiplications with:
-//!   * a fixed-base table for `z*w*G` (G is constant) -> zero point doublings,
-//!   * a width-`W` wNAF windowed multiply for `r*w*Q` -> ~1/(W+1) additions,
-//!   * clean `double()` calls (no equal-point probe waste),
-//!   * mixed projective+affine additions for the fixed-base term.
+//! # Public API
 //!
-//! The `+/-` final check mirrors `verify`: the public key is recovered from its
-//! x-coordinate only, so both y-sign candidates are tried.
+//! | Function | Input contract | Semantics | Measured (one x86 laptop core) |
+//! |---|---|---|---|
+//! | [`verify_fast`] | x-only public key | drop-in for [`crate::verify`] | ~85 us (stock: ~350 us) |
+//! | [`verify_with_pubkey_point`] | full public-key point | either y sign accepted | ~63 us |
+//! | [`verify_batch`] | x-only, per-item results | same as `verify_fast` | amortizes only `s^-1` |
+//! | [`verify_batch_with_nonce_points`] | full `Q` and nonce point `R` | exact equation, all-or-nothing | ~18-22 us/signature at N >= 256 |
+//!
+//! # Design
+//!
+//! Relative to the generic double-and-add in [`crate::verify`]:
+//!   * `z*w*G` uses a precomputed fixed-base comb for the generator (one mixed
+//!     addition per 7-bit window, zero doublings). The ~290 KB table is built
+//!     once on first use (~4 ms) behind a `OnceLock`.
+//!   * `r*w*Q` uses width-5 wNAF over Jacobian coordinates (`dbl-2007-bl`,
+//!     1M+8S doubling with the curve's `a = 1` making `a*Z^4` a plain square;
+//!     dedicated SOS squaring makes S < M).
+//!   * Public-key y-recovery uses Cipolla's square root, which is O(log p);
+//!     the STARK prime's 2-adicity of 192 makes the stock Tonelli-Shanks the
+//!     single most expensive step of `verify` (~100 us).
+//!   * Scalar-field arithmetic (`s^-1`, `z*w`, `r*w` mod n) runs on fixed-size
+//!     `crypto-bigint` Montgomery residues with compile-time parameters.
+//!   * The final `x == r` comparison happens projectively (`X == r*Z`), so no
+//!     field inversion is spent converting to affine.
+//!   * [`verify_batch_with_nonce_points`] checks all signatures at once: a
+//!     random linear combination of the per-signature equations
+//!     `(z*w)*G + (r*w)*Q - R = 0` is evaluated as one Pippenger bucket
+//!     multi-scalar multiplication (soundness error ~2^-128 from 128-bit
+//!     seed-derived coefficients).
+//!
+//! # Semantics
+//!
+//! The x-only paths preserve chain semantics exactly: the recovered public key
+//! may have either y sign, so both `+/-` candidates of `zwG +/- rwQ` are
+//! tried, and every input range check matches [`crate::verify`]. One deliberate
+//! difference: when a candidate sum is the point at infinity, stock `verify`
+//! panics (`to_affine().unwrap()`); this module returns `Ok(false)`, which is
+//! the mathematically correct answer (infinity has no affine x-coordinate).
+//!
+//! The full-point paths verify the exact group equation for the supplied
+//! `(Q, R)`; protocols using them must fix a y-parity convention to stay
+//! equivalent to on-chain x-only acceptance.
+//!
+//! Everything here is single-threaded; concurrent callers are safe (the only
+//! shared state is the immutable generator table).
 
 use crypto_bigint::modular::runtime_mod::{DynResidue, DynResidueParams};
 use crypto_bigint::{ArrayEncoding, U256};
