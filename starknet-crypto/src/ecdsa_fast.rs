@@ -544,6 +544,154 @@ pub fn verify_batch(items: &[(Felt, Felt, Felt, Felt)]) -> Vec<Result<bool, Veri
     results
 }
 
+/// Window width for the batch Pippenger MSM, by term count.
+fn pippenger_window(term_count: usize) -> usize {
+    match term_count {
+        0..=256 => 7,
+        257..=1024 => 8,
+        _ => 9,
+    }
+}
+
+/// Pippenger bucket MSM over affine points: computes `sum(scalar_i * point_i)`.
+fn pippenger_msm(scalars: &[U256], points: &[AffinePoint]) -> ProjectivePoint {
+    let window = pippenger_window(scalars.len());
+    let windows_count = 256usize.div_ceil(window);
+    let bucket_count = (1usize << window) - 1;
+    let mut accumulator = ProjectivePoint::identity();
+
+    for window_index in (0..windows_count).rev() {
+        for _ in 0..window {
+            accumulator = accumulator.double();
+        }
+        let mut buckets = vec![ProjectivePoint::identity(); bucket_count];
+        for (scalar, point) in scalars.iter().zip(points) {
+            let bit_offset = window_index * window;
+            let mut digit = 0usize;
+            for bit in 0..window {
+                let position = bit_offset + bit;
+                if position < 256 && scalar.bit_vartime(position) {
+                    digit |= 1 << bit;
+                }
+            }
+            if digit != 0 {
+                buckets[digit - 1] += point;
+            }
+        }
+        // Suffix sums turn the buckets into sum(digit * bucket[digit]).
+        let mut running = ProjectivePoint::identity();
+        let mut window_sum = ProjectivePoint::identity();
+        for bucket in buckets.iter().rev() {
+            running += bucket;
+            window_sum += &running;
+        }
+        accumulator += &window_sum;
+    }
+    accumulator
+}
+
+/// Probabilistic all-or-nothing batch verification of ECDSA signatures whose
+/// full nonce point `R` is transmitted alongside `(s)` (the classic `r` is
+/// derived here as `x(R) mod n`, handling the rare `x >= n` case exactly like
+/// the scalar reduction in signing).
+///
+/// Each item is `(public_key_point, message, nonce_point, s)`. Verifies the
+/// exact group equation `(z*w)*G + (r*w)*Q == R` for every item at once via a
+/// random linear combination evaluated as one Pippenger multi-scalar
+/// multiplication: cost per signature drops well below a single verification
+/// for batches of ~64 and larger.
+///
+/// - Returns `Ok(true)` iff every signature satisfies its equation (soundness
+///   error ~2^-128 per batch from the 128-bit random coefficients).
+/// - Returns `Ok(false)` if at least one signature is invalid; use bisection
+///   over sub-batches (or per-item [`verify_with_pubkey_point`]) to locate it.
+/// - Returns `Err` on the first item whose values fail the stock range checks.
+///
+/// `random_seed` MUST be unpredictable to signature submitters (e.g. from a
+/// CSPRNG per batch); a predictable seed lets an attacker craft signatures
+/// that cancel in the combination.
+///
+/// Unlike the x-only [`verify_fast`], this checks the exact `(Q, R)` supplied:
+/// chain-equivalent acceptance requires the protocol to fix the y-parity
+/// convention for public keys and nonce points.
+pub fn verify_batch_with_nonce_points(
+    items: &[(AffinePoint, Felt, AffinePoint, Felt)],
+    random_seed: &[u8; 32],
+) -> Result<bool, VerifyError> {
+    if items.is_empty() {
+        return Ok(true);
+    }
+
+    // Batched w_i = s_i^-1 mod n (Montgomery's trick), with stock range checks.
+    let one = DynResidue::new(&U256::ONE, SCALAR_PARAMS);
+    let mut s_residues = Vec::with_capacity(items.len());
+    for (public_key_point, message, nonce_point, s) in items {
+        if public_key_point.is_identity() || nonce_point.is_identity() {
+            return Err(VerifyError::InvalidPublicKey);
+        }
+        check_ranges(message, &nonce_point.x(), s)?;
+        s_residues.push(DynResidue::new(&felt_to_u256(s), SCALAR_PARAMS));
+    }
+    let mut prefix = Vec::with_capacity(s_residues.len());
+    let mut running = one;
+    for s_residue in &s_residues {
+        running *= s_residue;
+        prefix.push(running);
+    }
+    let mut inverse = running.invert().0;
+    let mut w_residues = vec![one; s_residues.len()];
+    for index in (0..s_residues.len()).rev() {
+        let preceding = if index == 0 { one } else { prefix[index - 1] };
+        w_residues[index] = inverse * preceding;
+        inverse *= &s_residues[index];
+    }
+
+    // Random 128-bit coefficients derived from the seed (delta_0 = 1).
+    let seed_low = Felt::from_bytes_be_slice(&random_seed[..16]);
+    let seed_high = Felt::from_bytes_be_slice(&random_seed[16..]);
+
+    let mut scalars = Vec::with_capacity(2 * items.len() + 1);
+    let mut points = Vec::with_capacity(2 * items.len() + 1);
+    let mut g_coefficient = DynResidue::new(&U256::ZERO, SCALAR_PARAMS);
+    for (index, (public_key_point, message, nonce_point, _s)) in items.iter().enumerate() {
+        let delta_residue = if index == 0 {
+            one
+        } else {
+            let digest = crate::poseidon_hash_many(&[seed_low, seed_high, Felt::from(index as u64)]);
+            let mut delta_bytes = [0u8; 16];
+            delta_bytes.copy_from_slice(&digest.to_bytes_be()[16..]);
+            DynResidue::new(&felt_to_u256(&Felt::from_bytes_be_slice(&delta_bytes)), SCALAR_PARAMS)
+        };
+        let w_residue = w_residues[index];
+
+        // r = x(R) mod n, then the stock range checks on the reduced value.
+        let r_residue = DynResidue::new(&felt_to_u256(&nonce_point.x()), SCALAR_PARAMS);
+        let r_reduced = u256_to_felt(&r_residue.retrieve());
+        if r_reduced == Felt::ZERO || r_reduced >= ELEMENT_UPPER_BOUND {
+            return Err(VerifyError::InvalidR);
+        }
+        let w_value = u256_to_felt(&w_residue.retrieve());
+        if w_value == Felt::ZERO || w_value >= ELEMENT_UPPER_BOUND {
+            return Err(VerifyError::InvalidS);
+        }
+
+        g_coefficient =
+            g_coefficient + delta_residue * DynResidue::new(&felt_to_u256(message), SCALAR_PARAMS) * w_residue;
+
+        scalars.push((delta_residue * r_residue * w_residue).retrieve());
+        points.push(public_key_point.clone());
+
+        scalars.push(delta_residue.retrieve());
+        points.push(-nonce_point);
+    }
+    scalars.push(g_coefficient.retrieve());
+    points.push(AffinePoint::generator());
+
+    // The combination sums to the identity iff every equation holds.
+    let combination = pippenger_msm(&scalars, &points);
+    Ok(combination.to_affine().is_err())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,6 +1241,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mod_inverse(&s_value, &EC_ORDER), expected_w, "stock mod_inverse mismatch");
+    }
+
+    /// Batch MSM verification must accept valid batches, reject any tampering,
+    /// and agree with per-item verification.
+    #[test]
+    fn batch_with_nonce_points_accepts_valid_and_rejects_tampered() {
+        let seed = [7u8; 32];
+        let mut state = 0xBA7C_4000_0DDB_A115u64;
+        let mut items = Vec::new();
+        for _ in 0..96 {
+            let private_key = random_below_bound(&mut state) + Felt::ONE;
+            let message = random_below_bound(&mut state);
+            let k = rfc6979_generate_k(&message, &private_key, None);
+            let signature = sign(&private_key, &message, &k).unwrap();
+            let nonce_point = fixed_base_mul(&k).to_affine().unwrap();
+            // The exact batch equation holds for the TRUE public key point
+            // Q = private_key * G (its y-parity is fixed by the private key),
+            // which is what a signer publishes under this scheme.
+            let public_key_point = fixed_base_mul(&private_key).to_affine().unwrap();
+            items.push((public_key_point, message, nonce_point, signature.s));
+        }
+        assert_eq!(verify_batch_with_nonce_points(&items, &seed).ok(), Some(true));
+        // Per-item parity for a few entries.
+        for (public_key_point, message, nonce_point, s) in items.iter().take(8) {
+            assert_eq!(
+                verify_with_pubkey_point(public_key_point, message, &nonce_point.x(), s).ok(),
+                Some(true)
+            );
+        }
+
+        // Any single tampering must sink the whole batch.
+        let mut tampered = items.clone();
+        tampered[41].3 = tampered[41].3 + Felt::ONE;
+        assert_eq!(verify_batch_with_nonce_points(&tampered, &seed).ok(), Some(false));
+
+        let mut tampered_message = items.clone();
+        tampered_message[7].1 = tampered_message[7].1 + Felt::ONE;
+        assert_eq!(verify_batch_with_nonce_points(&tampered_message, &seed).ok(), Some(false));
+
+        // Wrong y-parity of a transmitted nonce point must fail (exact equation).
+        let mut flipped_nonce = items.clone();
+        flipped_nonce[3].2 = -&flipped_nonce[3].2;
+        assert_eq!(verify_batch_with_nonce_points(&flipped_nonce, &seed).ok(), Some(false));
+
+        // Empty batch is vacuously valid; range violations error out.
+        assert_eq!(verify_batch_with_nonce_points(&[], &seed).ok(), Some(true));
+        let mut bad_range = items[..4].to_vec();
+        bad_range[2].3 = Felt::ZERO;
+        assert!(verify_batch_with_nonce_points(&bad_range, &seed).is_err());
     }
 
     /// Every private-key -> public-key pair in the StarkEx precomputed vectors

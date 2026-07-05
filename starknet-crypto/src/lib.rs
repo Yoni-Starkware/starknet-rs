@@ -42,7 +42,9 @@ pub use poseidon_hash::{
 
 pub use ecdsa::{get_public_key, recover, sign, verify, ExtendedSignature, Signature};
 
-pub use ecdsa_fast::{verify_batch, verify_fast, verify_with_pubkey_point};
+pub use ecdsa_fast::{
+    verify_batch, verify_batch_with_nonce_points, verify_fast, verify_with_pubkey_point,
+};
 
 pub use crate::rfc6979::generate_k as rfc6979_generate_k;
 

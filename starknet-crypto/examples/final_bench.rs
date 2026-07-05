@@ -6,7 +6,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use starknet_crypto::{
-    get_public_key, rfc6979_generate_k, sign, verify, verify_fast, verify_with_pubkey_point, Felt,
+    get_public_key, rfc6979_generate_k, sign, verify, verify_batch_with_nonce_points, verify_fast,
+    verify_with_pubkey_point, Felt,
 };
 use starknet_types_core::curve::AffinePoint;
 
@@ -79,4 +80,40 @@ fn main() {
 
     println!("\noverall verify speedup (avg over {CASES} cases): {:.2}x", stock / fast);
     println!("with full pubkey point:                          {:.2}x", stock / with_point);
+
+    // Batch MSM verification (signature carries the full nonce point R).
+    let salt = Felt::from_hex("0x3c1e9550e66958296d11b60f8e8e7a7ad990d07fa65d5f7652c4a6c87d4e3cc")
+        .unwrap();
+    let batch_items: Vec<(AffinePoint, Felt, AffinePoint, Felt)> = (1u64..=1024)
+        .map(|i| {
+            let private_key = salt * Felt::from(i.wrapping_mul(0x2545_F491_4F6C_DD1D));
+            let message = Felt::from(i).pow(7u64) * salt;
+            let k = rfc6979_generate_k(&message, &private_key, None);
+            let signature = sign(&private_key, &message, &k).unwrap();
+            let generator = AffinePoint::generator();
+            let generator_proj =
+                starknet_types_core::curve::ProjectivePoint::from_affine(generator.x(), generator.y())
+                    .unwrap();
+            let nonce_point = (&generator_proj * k).to_affine().unwrap();
+            let public_key_point = (&generator_proj * private_key).to_affine().unwrap();
+            (public_key_point, message, nonce_point, signature.s)
+        })
+        .collect();
+    let seed = [42u8; 32];
+    println!("\nbatch MSM verify (verify_batch_with_nonce_points, all-or-nothing):");
+    for batch_size in [256usize, 1024] {
+        let subset = &batch_items[..batch_size];
+        assert_eq!(verify_batch_with_nonce_points(subset, &seed).ok(), Some(true));
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            assert!(verify_batch_with_nonce_points(subset, &seed).unwrap());
+            best = best.min(start.elapsed().as_secs_f64() / batch_size as f64);
+        }
+        println!(
+            "  N={batch_size:<5} {:>7.2} us/sig   ({:.1}x vs single verify_with_pubkey_point)",
+            best * 1e6,
+            with_point / best
+        );
+    }
 }
